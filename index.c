@@ -1,4 +1,27 @@
-﻿
+
+
+Skip to content
+Using Maharana Pratap Group of Institutions Mail with screen readers
+
+Conversations
+ 
+Program Policies
+Powered by Google
+Last account activity: 25 minutes ago
+Details
+//Status Words{
+//
+//    6F00->ABORTED
+//6700->WRONG LENGTH
+//6A86->INVALID PARAMETERS(INCORRECT P1 AND P2)
+//6A80->PARAMETERS IN DATA FIELD ARE INCORRECT
+//6A84->INSUFFICENT MEMORY
+//0900->SUCCESS
+//6D00->INVLID INS
+//
+//}
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -8,7 +31,7 @@
 
 #define MAX_SIZE 1024
 #define MAX_CHILDREN 10
-#define MAX_DATA_SIZE 256
+#define MAX_DATA_SIZE 40
 
 typedef enum {
     FILE_MF = 0x79,  // 79 -> MF
@@ -35,7 +58,7 @@ int used_size = 0;
 File* find_by_fid(File* file, uint16_t fid);
 File* select_file(uint16_t fid);
 File* create(FileType type, uint16_t fid, int size, File* parent, const char* data);
-//void return_status(uint16_t status);
+
 void return_data_and_status(const char* data, size_t data_len, uint16_t status);
 void generate_fcp_data(File* file, char* buffer, size_t buffer_size);
 
@@ -53,6 +76,281 @@ FileType parse_file_type(uint8_t tag) {
 void to_upper(char* str) {
     for (int i = 0; str[i]; ++i)
         str[i] = toupper((unsigned char)str[i]);
+}
+
+File* find_by_fid(File* file, uint16_t fid) {
+    // Base case: null check
+    if (!file) return NULL;
+
+    // Check if this is the file we're looking for
+    if (file->id == fid) return file;
+
+    // Recursive check through children
+    for (int i = 0; i < file->childCount; ++i) {
+        File* result = find_by_fid(file->children[i], fid);
+        if (result) return result;
+    }
+
+    // If this is the root (MF) and we still haven't found the file,
+    // check if it might be in the file system but not loaded in memory
+    if (file == MF) {
+        // Try to find it directly in the file
+        FILE* fp = NULL;
+        errno_t err = fopen_s(&fp, "memory_store.bin", "rb");
+        if (err != 0 || fp == NULL) {
+            return NULL; // Can't open file
+        }
+
+        uint8_t fid_high, fid_low;
+        uint16_t current_fid;
+        uint8_t current_type;
+
+        // Skip MF header - we've already checked MF
+        if (fread(&fid_high, sizeof(uint8_t), 1, fp) != 1 ||
+            fread(&fid_low, sizeof(uint8_t), 1, fp) != 1 ||
+            fread(&current_type, sizeof(uint8_t), 1, fp) != 1) {
+            fclose(fp);
+            return NULL;
+        }
+
+        // Skip child count
+        int child_count;
+        if (fread(&child_count, sizeof(int), 1, fp) != 1) {
+            fclose(fp);
+            return NULL;
+        }
+
+        // Skip child FIDs
+        fseek(fp, MAX_CHILDREN * sizeof(uint16_t), SEEK_CUR);
+
+        // Skip MF size and data
+        int mf_size;
+        if (fread(&mf_size, sizeof(int), 1, fp) != 1) {
+            fclose(fp);
+            return NULL;
+        }
+        fseek(fp, mf_size, SEEK_CUR);
+
+        // Now read all DFs and EFs
+        while (!feof(fp)) {
+            long file_start = ftell(fp);
+
+            // Read FID
+            if (fread(&fid_high, sizeof(uint8_t), 1, fp) != 1 ||
+                fread(&fid_low, sizeof(uint8_t), 1, fp) != 1) {
+                break; // End of file or error
+            }
+
+            current_fid = (fid_high << 8) | fid_low;
+
+            // Read type
+            if (fread(&current_type, sizeof(uint8_t), 1, fp) != 1) {
+                break;
+            }
+
+            // If this is the file we're looking for
+            if (current_fid == fid) {
+                // Found the file, now load it
+                fseek(fp, file_start, SEEK_SET);
+                File* found_file = NULL;
+
+                if (current_type == FILE_DF) {
+                    // Load DF
+                    found_file = (File*)malloc(sizeof(File));
+                    if (!found_file) {
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    found_file->id = current_fid;
+                    found_file->type = FILE_DF;
+                    found_file->parent = MF; // Parent is MF for DFs
+
+                    // Skip FID and type
+                    fseek(fp, 3, SEEK_CUR);
+
+                    // Read size
+                    if (fread(&found_file->size, sizeof(int), 1, fp) != 1) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    // Read child count
+                    if (fread(&found_file->childCount, sizeof(int), 1, fp) != 1) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    // Initialize the children array
+                    for (int i = 0; i < MAX_CHILDREN; i++) {
+                        found_file->children[i] = NULL;
+                    }
+
+                    // Read child FIDs but don't load children yet (lazy loading)
+                    uint16_t child_fids[MAX_CHILDREN];
+                    if (fread(child_fids, sizeof(uint16_t), MAX_CHILDREN, fp) != MAX_CHILDREN) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    // Read data
+                    found_file->data = (char*)malloc(found_file->size + 1);
+                    if (!found_file->data) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    if (found_file->size > 0) {
+                        if (fread(found_file->data, sizeof(char), found_file->size, fp) != found_file->size) {
+                            free(found_file->data);
+                            free(found_file);
+                            fclose(fp);
+                            return NULL;
+                        }
+                        found_file->data[found_file->size] = '\0';
+                    }
+                    else {
+                        found_file->data[0] = '\0';
+                    }
+
+                    // Add to MF's children array if it's not already there
+                    bool already_in_children = false;
+                    for (int i = 0; i < MF->childCount; i++) {
+                        if (MF->children[i] && MF->children[i]->id == found_file->id) {
+                            already_in_children = true;
+                            break;
+                        }
+                    }
+
+                    if (!already_in_children && MF->childCount < MAX_CHILDREN) {
+                        MF->children[MF->childCount++] = found_file;
+                    }
+
+                    fclose(fp);
+                    return found_file;
+                }
+                else if (current_type == FILE_EF) {
+                    // Load EF
+                    found_file = (File*)malloc(sizeof(File));
+                    if (!found_file) {
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    found_file->id = current_fid;
+                    found_file->type = FILE_EF;
+                    found_file->childCount = 0; // EFs don't have children
+
+                    // Skip FID and type
+                    fseek(fp, 3, SEEK_CUR);
+
+                    // Read parent FID
+                    uint16_t parent_fid;
+                    if (fread(&fid_high, sizeof(uint8_t), 1, fp) != 1 ||
+                        fread(&fid_low, sizeof(uint8_t), 1, fp) != 1) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    parent_fid = (fid_high << 8) | fid_low;
+
+                    // Find parent - we might need to recursively load it
+                    found_file->parent = find_by_fid(MF, parent_fid);
+                    if (!found_file->parent) {
+                        // Parent not found - this should not happen in a valid file system
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    // Read size
+                    if (fread(&found_file->size, sizeof(int), 1, fp) != 1) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    // Read data
+                    found_file->data = (char*)malloc(found_file->size + 1);
+                    if (!found_file->data) {
+                        free(found_file);
+                        fclose(fp);
+                        return NULL;
+                    }
+
+                    if (found_file->size > 0) {
+                        if (fread(found_file->data, sizeof(char), found_file->size, fp) != found_file->size) {
+                            free(found_file->data);
+                            free(found_file);
+                            fclose(fp);
+                            return NULL;
+                        }
+                        found_file->data[found_file->size] = '\0';
+                    }
+                    else {
+                        found_file->data[0] = '\0';
+                    }
+
+                    // Add to parent's children array if it's not already there
+                    bool already_in_children = false;
+                    for (int i = 0; i < found_file->parent->childCount; i++) {
+                        if (found_file->parent->children[i] && found_file->parent->children[i]->id == found_file->id) {
+                            already_in_children = true;
+                            break;
+                        }
+                    }
+
+                    if (!already_in_children && found_file->parent->childCount < MAX_CHILDREN) {
+                        found_file->parent->children[found_file->parent->childCount++] = found_file;
+                    }
+
+                    fclose(fp);
+                    return found_file;
+                }
+            }
+
+            // Not the file we're looking for, skip to next file
+            if (current_type == FILE_DF) {
+                // Skip size
+                int df_size;
+                if (fread(&df_size, sizeof(int), 1, fp) != 1) {
+                    break;
+                }
+
+                // Skip child count and child FIDs
+                int df_child_count;
+                if (fread(&df_child_count, sizeof(int), 1, fp) != 1) {
+                    break;
+                }
+
+                // Skip child FIDs and data
+                fseek(fp, MAX_CHILDREN * sizeof(uint16_t) + df_size, SEEK_CUR);
+            }
+            else if (current_type == FILE_EF) {
+                // Skip parent FID
+                fseek(fp, 2, SEEK_CUR);
+
+                // Skip size
+                int ef_size;
+                if (fread(&ef_size, sizeof(int), 1, fp) != 1) {
+                    break;
+                }
+
+                // Skip data
+                fseek(fp, ef_size, SEEK_CUR);
+            }
+        }
+
+        fclose(fp);
+    }
+
+    // File not found
+    return NULL;
 }
 
 // Function to load file structure from the binary file
@@ -125,7 +423,10 @@ int load_file_structure() {
     }
     mf_data[mf_size] = '\0'; // Null-terminate the string
 
-    // Create MF in memory
+
+
+
+    // Create MF in memor
     MF = (File*)malloc(sizeof(File));
     if (!MF) {
         printf("Memory allocation failed for MF. Starting fresh.\n");
@@ -145,7 +446,7 @@ int load_file_structure() {
     current_dir = MF;
     used_size = mf_size;
 
-    printf("Loaded MF: FID=0x%04X, Size=%d\n", MF->id, MF->size);
+    printf("Loaded MF: FID=0x%04X\n", MF->id);
 
     // Read DF entries
     for (int i = 0; i < df_count; i++) {
@@ -204,7 +505,7 @@ int load_file_structure() {
         if (MF->childCount < MAX_CHILDREN) {
             MF->children[MF->childCount++] = df;
             used_size += df_size;
-            printf("Loaded DF: FID=0x%04X, Size=%d\n", df->id, df->size);
+            printf("Loaded DF: FID=0x%04X\n", df->id);
         }
         else {
             printf("MF has too many children, can't add DF: 0x%04X\n", df_fid);
@@ -243,10 +544,6 @@ int load_file_structure() {
             break;
         }
         FileType ef_type = (FileType)type_byte;
-
-        // Find the parent DF for this EF
-        // For simplicity, we'll find it by scanning through the first few bytes of the EF data
-        // This is a simplified approach - in a real system, you'd have explicit parent-child links
         char* ef_data = (char*)malloc(ef_size + 1);
         if (!ef_data) {
             printf("Memory allocation failed for EF data. Stopping EF load.\n");
@@ -295,8 +592,8 @@ int load_file_structure() {
         if (parent_df->childCount < MAX_CHILDREN) {
             parent_df->children[parent_df->childCount++] = ef;
             used_size += ef_size;
-            printf("Loaded EF: FID=0x%04X, Size=%d, Parent=0x%04X\n",
-                ef->id, ef->size, parent_df->id);
+            printf("Loaded EF: FID=0x%04X, Parent=0x%04X\n",
+                ef->id,  parent_df->id);
         }
         else {
             printf("Parent DF has too many children, can't add EF: 0x%04X\n", ef_fid);
@@ -309,147 +606,166 @@ int load_file_structure() {
     return 1;
 }
 
-// Helper to write EF metadata into memory_store.bin
-void write_ef_to_file(File* ef) {
-    if (!ef || ef->type != FILE_EF || !ef->parent || ef->parent->type != FILE_DF) return;
-
-    FILE* fp = NULL;
-    errno_t err = fopen_s(&fp, "memory_store.bin", "rb+");
-    if (err != 0 || fp == NULL) {
-        printf("Failed to open memory_store.bin to write EF\n");
-        return;
-    }
-
-    // Seek to the end of file for EF append
-    fseek(fp, 0, SEEK_END);
-
-    // EF layout: FID (2), Size (4), Type (1), Data (variable)
-    fwrite(&ef->id, sizeof(uint16_t), 1, fp);
-    fwrite(&ef->size, sizeof(int), 1, fp);
-
-    uint8_t type_byte = (uint8_t)ef->type;
-    fwrite(&type_byte, sizeof(uint8_t), 1, fp);
-
-    fwrite(ef->data, sizeof(char), ef->size, fp);
-
-    fclose(fp);
-}
-
-// Updated create function
 File* create(FileType type, uint16_t fid, int size, File* parent, const char* data) {
-    if (type == FILE_MF) {
-        if (fid != 0x3F00) {
-            printf("Invalid MF FID. MF must have FID=0x3F00.\n");
+        // Limit memory allocation to 1024 bytes, otherwise skip memory allocation
+        if (used_size > 1024) {
+            printf("File size exceeds 1024 bytes, skipping memory allocation for file ID 0x%04X.\n", fid);
+            
             return NULL;
         }
 
-        // Check if MF already exists on disk
-        FILE* check_fp = fopen("memory_store.bin", "rb");
-        if (check_fp != NULL) {
-            printf("MF already exists in file.\n");
-            fclose(check_fp);
+        // Structural validation
+        if (fid == 0x3F00 && type != FILE_MF) {
+            printf("FID 0x3F00 is reserved for MF only. Cannot create DF or EF with this FID.\n");
             return NULL;
         }
 
-        // Create new MF file
-        FILE* fp = fopen("memory_store.bin", "wb");
-        if (fp == NULL) {
-            printf("Failed to create memory_store.bin\n");
+
+        if (type == FILE_EF && !parent){
+            printf("EF must be inside a DF.\n");
             return NULL;
         }
 
-        // Write MF metadata
-        uint8_t high = (fid >> 8) & 0xFF;
-        uint8_t low = fid & 0xFF;
-        fwrite(&high, sizeof(uint8_t), 1, fp);
-        fwrite(&low, sizeof(uint8_t), 1, fp);
-
-        uint8_t type_byte = (uint8_t)type;
-        fwrite(&type_byte, sizeof(uint8_t), 1, fp);
-
-        int initial_df_count = 0;
-        fwrite(&initial_df_count, sizeof(int), 1, fp);
-
-        // Reserve space for MAX_CHILDREN DF FIDs
-        uint16_t empty_fid = 0x0000;
-        for (int i = 0; i < MAX_CHILDREN; i++) {
-            fwrite(&empty_fid, sizeof(uint16_t), 1, fp);
+        if (type == FILE_DF && (!parent || parent->type != FILE_MF)) {
+            printf("DF must be inside MF.\n");
+            return NULL;
         }
 
-        // Write MF size and data
-        fwrite(&size, sizeof(int), 1, fp);
+        // Check for duplicate FIDs within the same parent directory
+        if (parent) {
+            for (int i = 0; i < parent->childCount; i++) {
+                if (parent->children[i]->id == fid) {
+                    printf("FID 0x%04X already exists under parent 0x%04X.\n", fid, parent->id);
+                    return NULL;
+                }
+            }
+        }
+
+        // Ensure valid size
+        if (size < 0 || size > total_size ) {
+            printf("Invalid size: %d (max: %d)\n", size, total_size);
+            return NULL;
+        }
+
+        else if ((size <= 0 || size > total_size) && type == FILE_EF) {
+            printf("The EF size should not be zero ");
+            return NULL;
+        }
+
+
+        if (used_size + size > total_size) {
+            printf("Not enough space. Used: %d, Requested: %d, Max: %d\n", used_size, size, total_size);
+            return NULL;
+        }
+
+        // Allocate memory for the file structure (only if size is within limit)
+        File* new_file = (File*)malloc(sizeof(File));
+        if (!new_file) {
+            printf("Memory allocation failed for new file.\n");
+            return NULL;
+        }
+
+        // Initialize file structure
+        new_file->type = type;
+        new_file->id = fid;
+        new_file->size = size;
+        new_file->parent = parent;
+        new_file->childCount = 0;
+
+        // Allocate memory for file data (only if size is within limit)
+        new_file->data = (char*)malloc(size + 1);
+        if (!new_file->data) {
+            printf("Memory allocation failed for file data.\n");
+            free(new_file);
+            return NULL;
+        }
+
+        // Initialize data: Either copy from input or zero-out memory if no data is passed
         if (data) {
-            fwrite(data, sizeof(char), size, fp);
+            strncpy_s(new_file->data, size + 1, data, _TRUNCATE);
         }
         else {
-            char* zeros = (char*)calloc(size, sizeof(char));
-            fwrite(zeros, sizeof(char), size, fp);
-            free(zeros);
+            memset(new_file->data, 0, size + 1);  // Zero out memory if no data provided
         }
 
-        fclose(fp);
-    }
+        // Handle MF creation (root of the file system)
+        if (type == FILE_MF) {
+            if (fid != 0x3F00) {
+                printf("Invalid MF FID. MF must have FID=0x3F00.\n");
+                free(new_file->data);
+                free(new_file);
+                return NULL;
+            }
 
-    // Ensure valid size and space for new file includes meta data size or size
-    if (size < 0 || size > total_size) {
-        printf("Invalid size: %d (max: %d)\n", size, total_size);
-        return NULL;
-    }
+            // Check if MF already exists on disk
+            FILE* check_fp = fopen("memory_store.bin", "rb");
+            if (check_fp != NULL) {
+                printf("MF already exists in file.\n");
+                fclose(check_fp);
+                free(new_file->data);
+                free(new_file);
+                return NULL;
+            }
 
-    if (used_size + size > total_size) {
-        printf("Not enough space. Used: %d, Requested: %d, Max: %d\n", used_size, size, total_size);
-        return NULL;
-    }
+            // Create new MF file
+            FILE* fp = fopen("memory_store.bin", "wb");
+            if (fp == NULL) {
+                printf("Failed to create memory_store.bin\n");
+                free(new_file->data);
+                free(new_file);
+                return NULL;
+            }
 
-    // Structural validation
-    if (type == FILE_EF && (!parent || parent->type != FILE_DF)) {
-        printf("EF must be inside a DF.\n");
-        return NULL;
-    }
+            // Write MF file header
+            uint8_t high = (fid >> 8) & 0xFF;
+            uint8_t low = fid & 0xFF;
+            fwrite(&high, sizeof(uint8_t), 1, fp);
+            fwrite(&low, sizeof(uint8_t), 1, fp);
 
-    if (type == FILE_DF && (!parent || parent->type != FILE_MF)) {
-        printf("DF must be inside MF.\n");
-        return NULL;
-    }
+            uint8_t type_byte = (uint8_t)type;
+            fwrite(&type_byte, sizeof(uint8_t), 1, fp);
 
-    // Allocate memory for the file
-    File* new_file = (File*)malloc(sizeof(File));
-    if (!new_file) {
-        printf("Memory allocation failed for new file.\n");
-        return NULL;
-    }
+            int initial_df_count = 0;
+            fwrite(&initial_df_count, sizeof(int), 1, fp);
 
-    // Initialize file structure
-    new_file->type = type;
-    new_file->id = fid;
-    new_file->size = size;
-    new_file->parent = parent;
-    new_file->childCount = 0;
+            uint16_t empty_fid = 0x0000;
+            for (int i = 0; i < MAX_CHILDREN; i++) {
+                fwrite(&empty_fid, sizeof(uint16_t), 1, fp);
+            }
 
-    new_file->data = (char*)malloc(size + 1);
-    if (!new_file->data) {
-        printf("Memory allocation failed for file data.\n");
-        free(new_file);
-        return NULL;
-    }
+            fwrite(&size, sizeof(int), 1, fp);
 
-    if (data) {
-        strncpy_s(new_file->data, size + 1, data, _TRUNCATE);
-    }
-    else {
-        memset(new_file->data, 0, size + 1);
-    }
+            // Check if data is correct before writing
+            if (data) {
+                printf("Writing %d bytes of data to file.\n", size);
+                fwrite(data, sizeof(char), size, fp);
+            }
+            else {
+                printf("No data provided, writing zeros.\n");
+                char* zeros = (char*)calloc(size, sizeof(char));
+                fwrite(zeros, sizeof(char), size, fp);
+                free(zeros);
+            }
 
-    // Attach file in hierarchy
-    if (type == FILE_MF) {
-        MF = new_file;
-        current_dir = MF;
-    }
-    else if (parent->childCount < MAX_CHILDREN) {
-        parent->children[parent->childCount++] = new_file;
+            fclose(fp);
 
-        // --- DF Storage in BIN ---
-        if (type == FILE_DF && parent == MF) {
+            // Set global MF and current_dir pointers
+            MF = new_file;
+            current_dir = MF;
+        }
+        // Handle DF creation
+        else if (type == FILE_DF) {
+            if (parent->childCount >= MAX_CHILDREN) {
+                printf("Parent has too many children (max: %d).\n", MAX_CHILDREN);
+                free(new_file->data);
+                free(new_file);
+                return NULL;
+            }
+
+            // Add to parent's children array
+            parent->children[parent->childCount++] = new_file;
+
+            // Write DF to file
             FILE* fp = NULL;
             errno_t err = fopen_s(&fp, "memory_store.bin", "rb+");
             if (err == 0 && fp != NULL) {
@@ -461,30 +777,39 @@ File* create(FileType type, uint16_t fid, int size, File* parent, const char* da
                 fseek(fp, 3, SEEK_SET);
                 fwrite(&df_count, sizeof(int), 1, fp);
 
-                // Update DF FID array
+                // Update DF FID array in MF section
                 fseek(fp, 3 + sizeof(int) + (df_count - 1) * sizeof(uint16_t), SEEK_SET);
                 fwrite(&fid, sizeof(uint16_t), 1, fp);
 
-                // Append DF at the end
+                // Append DF at the end of file
                 fseek(fp, 0, SEEK_END);
 
-                // Write DF metadata
+                // Write DF header
                 uint8_t high = (fid >> 8) & 0xFF;
                 uint8_t low = fid & 0xFF;
-                uint8_t df_type = (uint8_t)type;
-
                 fwrite(&high, sizeof(uint8_t), 1, fp);
                 fwrite(&low, sizeof(uint8_t), 1, fp);
+
+                uint8_t df_type = (uint8_t)type;
                 fwrite(&df_type, sizeof(uint8_t), 1, fp);
 
-                // Write DF size
                 fwrite(&size, sizeof(int), 1, fp);
 
-                // Write DF data
+                int child_count = 0;
+                fwrite(&child_count, sizeof(int), 1, fp);
+
+                uint16_t empty_fid = 0x0000;
+                for (int i = 0; i < MAX_CHILDREN; i++) {
+                    fwrite(&empty_fid, sizeof(uint16_t), 1, fp);
+                }
+
+                // Check if data is correct before writing
                 if (data) {
+                    printf("Writing %d bytes of data to DF file.\n", size);
                     fwrite(data, sizeof(char), size, fp);
                 }
                 else {
+                    printf("No data provided, writing zeros to DF file.\n");
                     char* zeros = (char*)calloc(size, sizeof(char));
                     fwrite(zeros, sizeof(char), size, fp);
                     free(zeros);
@@ -493,113 +818,135 @@ File* create(FileType type, uint16_t fid, int size, File* parent, const char* da
                 fclose(fp);
             }
         }
+        // Handle EF creation
+        else if (type == FILE_EF) {
+            if (parent->childCount >= MAX_CHILDREN) {
+                printf("Parent has too many children (max: %d).\n", MAX_CHILDREN);
+                free(new_file->data);
+                free(new_file);
+                return NULL;
+            }
 
-        // --- EF Storage in BIN ---
-        if (type == FILE_EF && parent->type == FILE_DF) {
+            // Add to parent's children array
+            parent->children[parent->childCount++] = new_file;
+
+            // Write EF to file
             FILE* fp = NULL;
             errno_t err = fopen_s(&fp, "memory_store.bin", "rb+");
             if (err == 0 && fp != NULL) {
-                fseek(fp, 0, SEEK_END);
+                // Update the parent DF's child count and child FID list
+                if (parent->type == FILE_MF  || parent->type == FILE_DF ) {
+                    fseek(fp, 0, SEEK_SET);
+                    uint16_t current_fid;
+                    uint8_t current_type;
+                    uint8_t fid_high, fid_low;
 
-                // EF marker
-                char ef_tag = 'E';
-                fwrite(&ef_tag, sizeof(char), 1, fp);
+                    fseek(fp, 3 + sizeof(int) + MAX_CHILDREN * sizeof(uint16_t) + sizeof(int) + MF->size, SEEK_SET);
 
-                // Write EF FID
-                uint8_t high = (fid >> 8) & 0xFF;
-                uint8_t low = fid & 0xFF;
-                fwrite(&high, sizeof(uint8_t), 1, fp);
-                fwrite(&low, sizeof(uint8_t), 1, fp);
+                    bool found = false;
+                    long parent_pos = 0;
 
-                // Write EF size
-                fwrite(&size, sizeof(int), 1, fp);
+                    while (!feof(fp)) {
+                        parent_pos = ftell(fp);
+                        if (fread(&fid_high, sizeof(uint8_t), 1, fp) != 1) break;
+                        if (fread(&fid_low, sizeof(uint8_t), 1, fp) != 1) break;
+                        current_fid = (fid_high << 8) | fid_low;
 
-                // Write EF type
-                uint8_t type_byte = (uint8_t)type;
-                fwrite(&type_byte, sizeof(uint8_t), 1, fp);
+                        if (fread(&current_type, sizeof(uint8_t), 1, fp) != 1) break;
 
-                // Write parent DF FID for reference when loading
-                uint16_t parent_fid = parent->id;
-                fwrite(&parent_fid, sizeof(uint16_t), 1, fp);
+                        if (current_fid == parent->id && current_type == FILE_DF) {
+                            found = true;
+                            break;
+                        }
 
-                // Write EF data
-                if (new_file->data) {
-                    fwrite(new_file->data, sizeof(char), size, fp);
+                        int current_size;
+                        if (fread(&current_size, sizeof(int), 1, fp) != 1) break;
+
+                        int child_count;
+                        if (fread(&child_count, sizeof(int), 1, fp) != 1) break;
+                        fseek(fp, MAX_CHILDREN * sizeof(uint16_t) + current_size, SEEK_CUR);
+                    }
+
+                    if (found) {
+                        fseek(fp, parent_pos + 3 + sizeof(int), SEEK_SET);
+                        int child_count;
+                        fread(&child_count, sizeof(int), 1, fp);
+                        child_count++;
+                        fseek(fp, parent_pos + 3 + sizeof(int), SEEK_SET);
+                        fwrite(&child_count, sizeof(int), 1, fp);
+
+                        fseek(fp, parent_pos + 3 + sizeof(int) + sizeof(int) + (child_count - 1) * sizeof(uint16_t), SEEK_SET);
+                        fwrite(&fid, sizeof(uint16_t), 1, fp);
+                    }
                 }
-                else {
-                    char* empty = (char*)calloc(size, sizeof(char));
-                    fwrite(empty, sizeof(char), size, fp);
-                    free(empty);
-                }
-
                 fclose(fp);
             }
         }
-    }
-    else {
-        printf("Parent has too many children (max: %d).\n", MAX_CHILDREN);
-        free(new_file->data);
-        free(new_file);
-        return NULL;
-    }
-    size += sizeof(uint16_t) + sizeof(int) + sizeof(uint8_t); // FID, size, type
-    if (type == FILE_EF) {
-        size += sizeof(uint16_t); // Parent FID
-    }
-    used_size += size;
 
-    printf("%s created: FID=0x%04X, Size=%d, Under=0x%04X\n",
-        get_type_str(type), fid, size, parent ? parent->id : 0);
+        // Update used space
+        int metadata_size = sizeof(uint16_t) + sizeof(uint8_t) + sizeof(int); // FID, type, size
+        if (type == FILE_MF || type == FILE_DF) {
+            metadata_size += sizeof(int) + MAX_CHILDREN * sizeof(uint16_t); // childCount + childFIDs
+        }
+        if (type == FILE_EF) {
+            metadata_size += sizeof(uint16_t); // parentFID
+        }
+        used_size += size + metadata_size;
 
-    return new_file;
-} 
+        if (used_size > total_size) {
+            printf("Memory allocation failed");
+            free(new_file);
+            used_size -= (metadata_size + size);
 
-// ---------- Find by FID ----------
-File* find_by_fid(File* file, uint16_t fid) {
-    if (!file) return NULL;
-    if (file->id == fid) return file;
-    for (int i = 0; i < file->childCount; ++i) {
-        File* result = find_by_fid(file->children[i], fid);
-        if (result) return result;
+        }
+
+        //printf("%s created: FID=0x%04X, Size=%d, Under=0x%04X\n", get_type_str(type), fid, size, parent ? parent->id : 0);
+
+        return new_file;
     }
-    return NULL;
-}
 
 // ---------- Select File (Modified to return File*) ----------
-File* select_file(uint16_t fid) {
-    File* file = find_by_fid(MF, fid);
-    if (file) {
-        printf("SELECTED: %s FID=0x%04X, Size=%d\n",
-            get_type_str(file->type), file->id, file->size);
+    File* select_file(uint16_t fid) {
+        File* file = find_by_fid(MF, fid);
+        if (file) {
+            printf("SELECTED: %s FID=0x%04X", get_type_str(file->type), file->id);
 
-        if (file->type == FILE_DF) {
-            current_dir = file;
+            // If it's a DF, check if it's a direct child of the current directory
+            if (file->type == FILE_DF) {
+                // Check if the file is a direct child of the current directory (MF or any DF)
+                if (file->parent != current_dir) {
+                    printf("DF FID=0x%04X is not a direct child of the current directory.\n", file->id);
+                    return NULL;  // Don't allow selecting this DF if it's not a direct child
+                }
+                current_dir = file;  // Set the new current directory to this DF
+            }
+            else if (file->type == FILE_EF) {
+                // If it's an EF, show the data inside it.
+                if (file->data) {
+                    printf("Data inside EF (FID=0x%04X): %s\n", file->id, file->data);
+                }
+                else {
+                    printf("EF (FID=0x%04X) is empty.\n", file->id);
+                }
+            }
+            else if (file->type == FILE_MF) {
+                current_dir = file;
+                if (file->data) {
+                    printf("Data inside MF (FID=0x%04X): %s\n", file->id, file->data);
+                }
+                else {
+                    printf("MF (FID=0x%04X) is empty.\n", file->id);
+                }
+            }
         }
-        else if (file->type == FILE_EF) {
-            // If it's an EF, show the data inside it.
-            if (file->data) {
-                printf("Data inside EF (FID=0x%04X): %s\n", file->id, file->data);
-            }
-            else {
-                printf("EF (FID=0x%04X) is empty.\n", file->id);
-            }
+        else {
+            printf("File 0x%04X not found.\n", fid);
+            //return_status(0x6A82);
         }
-        else if (file->type == FILE_MF) {
-            current_dir = file;
-            if (file->data) {
-                printf("Data inside MF (FID=0x%04X): %s\n", file->id, file->data);
-            }
-            else {
-                printf("MF (FID=0x%04X) is empty.\n", file->id);
-            }
-        }
-    }
-    else {
-        printf("File 0x%04X not found.\n", fid);
+
+        return file;  // Return the file pointer
     }
 
-    return file;  // Return the file pointer
-}
 
 // ---------- Helper function to return status words ----------
 static void return_status(uint16_t status) {
@@ -625,22 +972,22 @@ void return_data_and_status(const char* data, size_t data_len, uint16_t status) 
 }
 
 // ---------- Generate FCP data for a file ----------
-void generate_fcp_data(File* file, char* buffer, size_t buffer_size) {
-    if (!file || !buffer || buffer_size == 0) return;
-
-    // Simple implementation - encoding FCP template with file ID and size
-    int length = 8; // Basic length for file ID and size tags
-
-    snprintf(buffer, buffer_size,
-        "62%02X"    // FCP template tag and length
-        "83020%04X" // File ID tag, length (2), and value
-        "8102%04X", // File size tag, length (2), and value
-        length,
-        file->id,
-        file->size);
-
-    // In a real implementation, you would include all relevant file attributes
-}
+//void generate_fcp_data(File* file, char* buffer, size_t buffer_size) {
+//    if (!file || !buffer || buffer_size == 0) return;
+//
+//    // Simple implementation - encoding FCP template with file ID and size
+//    int length = 8; // Basic length for file ID and size tags
+//
+//    snprintf(buffer, buffer_size,
+//        "62%02X"    // FCP template tag and length
+//        "83020%04X" // File ID tag, length (2), and value
+//        "8102%04X", // File size tag, length (2), and value
+//        length,
+//        file->id,
+//        file->size);
+//
+//    // In a real implementation, you would include all relevant file attributes
+//}
 
 // ---------- Memory ----------
 static void memory_used() {
@@ -651,7 +998,7 @@ static void memory_used() {
 static void print_tree(File* file, int level) {
     if (!file) return;
     for (int i = 0; i < level; ++i) printf("  ");
-    printf("%s: FID=0x%04X, Size=%d", get_type_str(file->type), file->id, file->size);
+    printf("%s: FID=0x%04X", get_type_str(file->type), file->id);
 
     // Print data content for visibility
     if (file->data && strlen(file->data) > 0) {
@@ -663,189 +1010,7 @@ static void print_tree(File* file, int level) {
     for (int i = 0; i < file->childCount; ++i)
         print_tree(file->children[i], level + 1);
 }
-
-// ---------- APDU Parser (Updated to match the uploaded code) ----------
-void parse_apdu(const char* apdu) {
-    unsigned int cla, ins, p1, p2, lc;
-    uint16_t fid = 0;
-    int size = 0;
-    FileType type = FILE_EF; // Default to avoid uninitialized use
-    char data[MAX_DATA_SIZE] = { 0 };
-
-    // Convert to uppercase input safely
-    char input[256] = { 0 };
-    if (strncpy_s(input, sizeof(input), apdu, _TRUNCATE) != 0) {
-        printf("APDU copy failed.\n");
-        return_status(0x6F00); // Technical problem
-        return;
-    }
-    to_upper(input);
-
-    //validate the values of cla , ins , p1 , p2
-    if (sscanf_s(input, "%02X%02X%02X%02X", &cla, &ins, &p1, &p2) < 4) {
-        printf("Invalid APDU format.\n");
-        return_status(0x6700); // Wrong length
-        return;
-    }
-
-
-    printf("CLA: 0x%02X, INS: 0x%02X, P1: 0x%02X, P2: 0x%02X", cla, ins, p1, p2);
-
-    if (ins == 0xE0) {  // CREATE
-        // Verify this is a standard CREATE command (CLA=0x00, P1=0x00, P2=0x00)
-        if (cla != 0x00 || p1 != 0x00 || p2 != 0x00) {
-            printf("Invalid parameters for CREATE. Expected CLA=0x00, P1=0x00, P2=0x00.\n");
-            return_status(0x6A86); // Incorrect P1-P2
-            return;
-        }
-
-        const char* ptr = input + 8; // Move past CLA, INS, P1, P2 (8 hex chars
-
-        if (strlen(ptr) < 2 || strncmp(ptr, "62", 2) != 0) {
-            printf("Missing FCP template tag (0x62). Invalid CREATE command data.\n");
-            return_status(0x6A80); // Incorrect parameters in data field
-            return;
-        }
-
-        lc = (unsigned int)(strlen(ptr) / 2);  // Each byte = 2 hex digits
-        printf("\nCalculated Lc (data length): 0x%02X (%u bytes)\n", lc, lc);
-
-
-        // Check for FCP template tag (0x62)
-        unsigned int template_tag = 0, template_len = 0;
-        if (strlen(ptr) >= 4) {
-            if (sscanf_s(ptr, "%02X%02X", &template_tag, &template_len) == 2 && template_tag == 0x62) {
-                printf("FCP Template Tag: 0x%02X, Length: %u\n", template_tag, template_len);
-                ptr += 4; // Move past template tag and length
-            }
-            else {
-                printf("Missing FCP template tag (0x62). Invalid CREATE command data.\n");
-                return_status(0x6A80); // Incorrect parameters in data field
-                return;
-            }
-        }
-
-        while (*ptr && strlen(ptr) >= 4) {
-            unsigned int tag = 0, len = 0;
-            if (sscanf_s(ptr, "%02X%02X", &tag, &len) != 2) {
-                printf("Tag/Len parse failed.\n");
-                return_status(0x6A80); // Incorrect parameters in data field
-                break;
-            }
-            ptr += 4;
-
-            // Bounds check for len * 2 (hex string)
-            if (len * 2 >= sizeof(data) || strlen(ptr) < len * 2) {
-                printf("Value length too long or malformed (tag: 0x%02X, len: %u)\n", tag, len);
-                return_status(0x6A80); // Incorrect parameters in data field
-                break;
-            }
-
-            char val[256] = { 0 };
-            strncpy_s(val, sizeof(val), ptr, len * 2);
-            val[len * 2] = '\0';  // Null-terminate
-            ptr += len * 2;
-
-            printf("Tag: 0x%02X, Length: %u, Value: %s\n", tag, len, val);
-
-            // Tag handling
-            switch (tag) {
-            case 0x82:  // File descriptor
-            {
-                unsigned int temp_type = 0;
-                if (sscanf_s(val, "%02X", &temp_type) == 1) {
-                    switch (temp_type) {
-                    case 0x79: type = FILE_MF; break;
-                    case 0x78: type = FILE_DF; break;
-                    case 0x41: type = FILE_EF; break;
-                    default:
-                        printf("Unknown file type: 0x%02X\n", temp_type);
-                        break;
-                    }
-                    printf("Parsed File Type: %d\n", type);
-                }
-            }
-            break;
-            case 0x83:  // File ID
-                if (sscanf_s(val, "%04hX", &fid) == 1)
-                    printf("File ID: 0x%04X\n", fid);
-                break;
-            case 0x8A:  // Life Cycle Status
-                printf("Life Cycle Status: %s\n", val);
-                break;
-            case 0x8C:  // Security Attributes
-                printf("Security Attributes: %s\n", val);
-                break;
-            case 0x80: {
-                unsigned int temp_size = 0;
-                if (sscanf_s(val, "%04X", &temp_size) != 1) {
-                    to_upper(val);
-                    printf("Failed to parse file size.\n");
-                }
-                else {
-                    size = (int)temp_size;
-                    printf("Parsed total file size: 0x%X\n", size);
-                }
-                break;
-            }
-            default:
-                printf("Unknown tag in FCP: 0x%02X\n", tag);
-                break;
-            }
-        }
-
-        // Validate and create file
-        if (size <= 0) {
-            printf("Invalid file size: %d\n", size);
-            return_status(0x6A80); // Incorrect parameters in data field
-            return;
-        }
-
-        File* parent = NULL;
-        if (type == FILE_DF) parent = MF;
-        else if (type == FILE_EF) parent = current_dir;
-
-        File* new_file = create(type, fid, size, parent, data);
-        if (!new_file) {
-            printf("File creation failed.\n");
-            return_status(0x6A84); // Not enough memory space
-            return;
-        }
-        return_status(0x9000); // Success
-    }
-    else if (ins == 0xA4) {  // SELECT
-        if (p1 != 0x00 || p2 != 0x04) {
-            printf("Invalid P1 or P2 for SELECT. Expected P1=0x00 and P2=0x04.\n");
-            return_status(0x6A86); // Incorrect P1-P2
-            return;
-        }
-        else if (p1 != 0x00 || p2 != 0x0C) {
-            printf("Select the file , no FCP return");
-            return_status(0x9000);
-        }
-
-        if (strlen(input) >= 14) {
-            if (sscanf_s(input + 10, "%04hX", &fid) == 1)
-                select_file(fid);
-            else {
-                printf("Failed to parse SELECT FID.\n");
-                return_status(0x6A80); // Incorrect parameters in data field
-            }
-        }
-        else {
-            printf("SELECT missing FID.\n");
-            return_status(0x6700); // Wrong length
-        }
-    }
-    else {
-        printf("Unsupported INS: 0x%02X\n", ins);
-        return_status(0x6D00); // Instruction not supported
-    }
-}
-
-
-// Write data to an existing EF
-void write_data_to_ef(File* ef, const char* data, int offset, int length) {
+static void write_ef(File* ef, const char* data, int offset, int length) {
     if (!ef || ef->type != FILE_EF) {
         printf("Can only write data to EF files.\n");
         return;
@@ -932,6 +1097,339 @@ void write_data_to_ef(File* ef, const char* data, int offset, int length) {
     printf("Could not find EF 0x%04X in the binary file\n", ef->id);
     fclose(fp);
 }
+// ---------- APDU Parser (Updated to match the uploaded code) ----------
+void parse_apdu(const char* apdu) {
+    unsigned int cla, ins, p1, p2, lc;
+    uint16_t fid = 0;
+    int size = 0;
+    FileType type = FILE_EF; // Default to avoid uninitialized use
+    char data[MAX_DATA_SIZE] = { 0 };
+
+    // Convert to uppercase input safely
+    char input[256] = { 0 };
+    if (strncpy_s(input, sizeof(input), apdu, _TRUNCATE) != 0) {
+        printf("APDU copy failed.\n");
+        return_status(0x6F00); // Technical problem
+        return;
+    }
+    to_upper(input);
+
+    // Validate the values of cla, ins, p1, p2
+    if (sscanf_s(input, "%02X%02X%02X%02X%02X", &cla, &ins, &p1, &p2,&lc) < 5) {
+        printf("Invalid APDU format.\n");
+        return_status(0x6700); // Wrong length
+        return;
+    }
+
+    printf("CLA: 0x%02X, INS: 0x%02X, P1: 0x%02X, P2: 0x%02X", cla, ins, p1, p2);
+
+    if (ins == 0xE0) {  // CREATE
+        // Verify this is a standard CREATE command (CLA=0x00, P1=0x00, P2=0x00)
+        if (cla != 0x00 || p1 != 0x00 || p2 != 0x00) {
+            printf("Invalid parameters for CREATE. Expected CLA=0x00, P1=0x00, P2=0x00.\n");
+            return_status(0x6A86); // Incorrect P1-P2
+            return;
+        }
+
+        // Extract Lc value from APDU command - expecting it after P1P2
+        unsigned int provided_lc = 0;
+        if (strlen(input) >= 10 && sscanf_s(input + 8, "%02X", &provided_lc) == 1) {
+            printf("\nProvided Lc in APDU: 0x%02X (%u bytes)\n", provided_lc, provided_lc);
+
+            // Move past CLA, INS, P1, P2, Lc (10 hex chars)
+            const char* ptr = input + 10;
+
+            // Calculate actual data length in bytes (excluding Lc byte itself)
+            unsigned int calculated_lc = 0;
+            if (strlen(ptr) > 0) {
+                calculated_lc = (unsigned int)(strlen(ptr) / 2);  // Each byte = 2 hex digits
+                printf("Calculated Lc (data length): 0x%02X (%u bytes)\n", calculated_lc, calculated_lc);
+
+                // Compare provided Lc with calculated Lc
+                if (provided_lc != calculated_lc) {
+                    printf("Lc mismatch! Provided: %u, Calculated: %u\n", provided_lc, calculated_lc);
+                    return_status(0xAB00); // Custom status code for Lc mismatch
+                    return;
+                }
+            }
+            else {
+                printf("No data provided after Lc\n");
+                if (provided_lc != 0) {
+                    printf("Lc mismatch! Provided: %u, Calculated: 0\n", provided_lc);
+                    return_status(0xAB00); // Custom status code for Lc mismatch
+                    return;
+                }
+            }
+
+            // Check for FCP template tag (0x62)
+            if (strlen(ptr) < 2 || strncmp(ptr, "62", 2) != 0) {
+                printf("Missing FCP template tag (0x62). Invalid CREATE command data.\n");
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            unsigned int template_tag = 0, template_len = 0;
+            if (strlen(ptr) >= 4) {
+                // Read FCP tag and declared length
+                if (sscanf_s(ptr, "%02X%02X", &template_tag, &template_len) == 2 && template_tag == 0x62) {
+                    printf("FCP Template Tag: 0x%02X, Declared Length: 0x%02X\n", template_tag, template_len);
+                    ptr += 4; // Move past the FCP tag and length bytes (2 bytes for tag, 2 bytes for length)
+
+                    // Calculate remaining hex digits (data after FCP header)
+                    size_t remaining_hex_digits = strlen(ptr);
+
+                    // Each byte is 2 hex characters, so calculate actual data size in bytes
+                    size_t available_fcp_bytes = remaining_hex_digits  / 2;
+                    //available_fcp_bytes += 5;
+
+                    // Check if the actual data bytes match the declared length
+                    if (available_fcp_bytes < template_len) {
+                        printf("FCP template data too short. Expected %0zu bytes, got %zu bytes\n", template_len, available_fcp_bytes);
+                        return_status(0x6A80); // Incorrect parameters
+                        exit(-1);
+                    }
+                    printf("FCP template data length matches: %zu bytes\n", available_fcp_bytes);
+                }
+            }
+           
+
+            bool has_file_descriptor = false;    // 0x82
+            bool has_file_id = false;           // 0x83
+            bool has_lifecycle_status = false;  // 0x8A
+            bool has_file_size = false;         // 0x81
+
+            while (*ptr && strlen(ptr) >= 4) {
+                unsigned int tag = 0, len = 0;
+                if (sscanf_s(ptr, "%02X%02X", &tag, &len) != 2) {
+                    printf("Tag/Len parse failed.\n");
+                    return_status(0x6A80); // Incorrect parameters in data field
+                    return;
+                }
+
+                ptr += 4;
+                // Bounds check for len * 2 (hex string)
+                if (len * 2 > sizeof(data) || strlen(ptr) < len * 2) {
+                    printf("Value length too long or malformed (tag: 0x%02X, len: %u)\n", tag, len);
+                    return_status(0x6A80); // Incorrect parameters in data field
+                    return;
+                }
+
+                char val[256] = { 0 };
+                strncpy_s(val, sizeof(val), ptr, len * 2);
+                val[len * 2] = '\0';  // Null-terminate
+                ptr += len * 2;
+                printf("Tag: 0x%02X, Length: %u, Value: %s\n", tag, len, val);
+
+                // Tag handling
+                switch (tag) {
+                case 0x82:  // File descriptor
+                {
+                    if (!has_file_descriptor) {
+                        has_file_descriptor = true;
+                        unsigned int temp_type = 0;
+                        if (sscanf_s(val, "%02X", &temp_type) == 1) {
+                            switch (temp_type) {
+                            case 0x79: type = FILE_MF; break;
+                            case 0x78: type = FILE_DF; break;
+                            case 0x41: type = FILE_EF; break;
+                            default:
+                                printf("Unknown file type: 0x%02X\n", temp_type);
+                                return_status(0x6A80); // Incorrect parameters
+                                return;
+                            }
+                            printf("Parsed File Type: %d\n", type);
+                        }
+                        else {
+                            printf("Failed to parse file descriptor.\n");
+                            return_status(0x6A80);
+                            return;
+                        }
+                    }
+                }
+                break;
+
+                case 0x83:  // File ID
+                    if (!has_file_id) {
+                        has_file_id = true;
+                        if (sscanf_s(val, "%04hX", &fid) == 1) {
+                            printf("File ID: 0x%04X\n", fid);
+                        }
+                        else {
+                            printf("Failed to parse file ID.\n");
+                            return_status(0x6A80);
+                            return;
+                        }
+                    }
+                    break;
+
+                case 0x8A:  // Life Cycle Status
+                    if (!has_lifecycle_status) {
+                        has_lifecycle_status = true;
+                        printf("Life Cycle Status: %s\n", val);
+                    }
+                    break;
+
+                case 0x81:  // File size
+                    if (!has_file_size) {
+                        has_file_size = true;
+                        unsigned int temp_size = 0;
+                        if (sscanf_s(val, "%04X", &temp_size) != 1) {
+                            to_upper(val);
+                            printf("Failed to parse file size.\n");
+                            return_status(0x6A80);
+                            return;
+                        }
+                        else {
+                            size = (int)temp_size;
+                            printf("Parsed file size: 0x%X\n", size);
+                        }
+                    }
+                    break;
+
+                case 0x80:  // Legacy size tag (also handle this)
+                {
+                    unsigned int temp_size = 0;
+                    if (sscanf_s(val, "%04X", &temp_size) != 1) {
+                        to_upper(val);
+                        printf("Failed to parse legacy file size.\n");
+                        return_status(0x6A80);
+                        return;
+                    }
+                    else {
+                        size = (int)temp_size;
+                        printf("Parsed legacy file size: 0x%X\n", size);
+                        has_file_size = true; // Mark as having file size
+                    }
+                    break;
+                }
+
+                case 0x8C:  // Security Attributes
+                    printf("Security Attributes: %s\n", val);
+                    break;
+
+                default:
+                    printf("Unknown tag in FCP: 0x%02X\n", tag);
+                    break;
+                }
+            }
+
+            // Validate that all mandatory tags are present
+            if (!has_file_descriptor) {
+                printf("Missing mandatory tag: File Descriptor (0x82)\n");
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            if (!has_file_id) {
+                printf("Missing mandatory tag: File ID (0x83)\n");
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            if (!has_lifecycle_status) {
+                printf("Missing mandatory tag: Life Cycle Status (0x8A)\n");
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            if (!has_file_size) {
+                printf("Missing mandatory tag: File Size (0x81 or 0x80)\n");
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            // Validate and create file
+            if (size < 0) {
+                printf("Invalid file size: %d\n", size);
+                return_status(0x6A80); // Incorrect parameters in data field
+                return;
+            }
+
+            File* parent = NULL;
+            if (type == FILE_MF) {
+                parent = NULL; // MF has no parent
+            }
+            else if (type == FILE_DF) {
+                parent = MF;
+            }
+            else if (type == FILE_EF) {
+                parent = current_dir;
+            }
+
+            File* new_file = create(type, fid, size, parent, data);
+            if (!new_file) {
+                printf("File creation failed.\n");
+                return_status(0x6A84); // Not enough memory space
+                return;
+            }
+            return_status(0x9000); // Success
+        }
+        else {
+            printf("Invalid or missing Lc value in APDU command.\n");
+            return_status(0x6700); // Wrong length
+            return;
+        }
+    }
+    else if (ins == 0xA4) {  // SELECT
+        // Fix the logical OR/AND issue in the condition
+        if (p1 != 0x00 || (p2 != 0x04 && p2 != 0x0C)) {
+            printf("Invalid P1 or P2 for SELECT\n");
+            return_status(0x6A86); // Incorrect P1-P2
+            return;
+        }
+
+        // Extract Lc value if present
+        unsigned int select_lc = 0;
+        if (strlen(input) >= 10 && sscanf_s(input + 8, "%02X", &select_lc) == 1) {
+            printf("\nProvided Lc in SELECT APDU: 0x%02X (%u bytes)\n", select_lc, select_lc);
+
+            // Check if the data length matches Lc
+            unsigned int calculated_select_lc = 0;
+            if (strlen(input) > 10) {
+                calculated_select_lc = (unsigned int)((strlen(input) - 10) / 2);
+                printf("Calculated Lc: 0x%02X (%u bytes)\n", calculated_select_lc, calculated_select_lc);
+
+                if (select_lc != calculated_select_lc) {
+                    printf("Lc mismatch in SELECT! Provided: %u, Calculated: %u\n", select_lc, calculated_select_lc);
+                    return_status(0xAB00); // Custom status code for Lc mismatch
+                    return;
+                }
+            }
+
+            // If data length is 2 bytes (4 hex chars), parse FID and select file
+            if (select_lc == 2 && calculated_select_lc == 2) {
+                if (sscanf_s(input + 10, "%04hX", &fid) == 1) {
+                    File* selected = select_file(fid);
+                    if (selected) {
+                        return_status(0x9000); // Success
+                    }
+                    else {
+                        return_status(0x6A82); // File not found
+                    }
+                }
+                else {
+                    printf("Failed to parse SELECT FID.\n");
+                    return_status(0x6A80); // Incorrect parameters in data field
+                    return;
+                }
+            }
+            else {
+                printf("Invalid data length for SELECT FID.\n");
+                return_status(0x6700); // Wrong length
+                return;
+            }
+        }
+        else {
+            printf("\nSELECT missing Lc or FID.\n");
+            return_status(0x6700); // Wrong length
+            return;
+        }
+    }
+    else {
+        printf("Unsupported INS: 0x%02X\n", ins);
+        return_status(0x6D00); // Instruction not supported
+    }
+}
 
 // Helper function to read data from an EF
 void read_ef_data(uint16_t fid) {
@@ -951,7 +1449,7 @@ void read_ef_data(uint16_t fid) {
 }
 
 // Function to update data in an EF
-void update_data_cmd(uint16_t fid, const char* data) {
+static void update_data_cmd(uint16_t fid, const char* data) {
     File* ef = find_by_fid(MF, fid);
     if (!ef || ef->type != FILE_EF) {
         printf("Cannot update: File 0x%04X not found or not an EF.\n", fid);
@@ -964,10 +1462,10 @@ void update_data_cmd(uint16_t fid, const char* data) {
         return;
     }
 
-    // Update data in memory and in file
-    write_data_to_ef(ef, data, 0, data_len);
+    write_ef(ef, data, 0, data_len);
     printf("Updated data in EF 0x%04X\n", fid);
 }
+
 
 // Function to free all allocated memory
 void cleanup_memory() {
@@ -1084,3 +1582,5 @@ int main() {
 
     return 0;
 }
+Apr 23 6_11 PM (2).txt
+Displaying Apr 23 6_11 PM (2).txt.
